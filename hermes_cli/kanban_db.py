@@ -310,6 +310,7 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+_CTX_MAX_BRIEFING_BYTES = 32 * 1024  # injected briefing text (compressed)
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -3888,6 +3889,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    _ctx_briefing(lines, conn, task, now)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
@@ -4063,6 +4065,171 @@ def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, no
         lines.append(
             f"- {row['id']} — {row['title']} ({_ctx_stamp(int(row['ended_at']), now)}): {first}"
         )
+    lines.append("")
+
+
+# --- C51: Agent Briefing injection hook -----------------------------------
+
+_TASK_TYPE_ALIASES: dict[str, list[str]] = {
+    "blog-publishing": ["blog-publishing", "blog", "article"],
+    "blog": ["blog", "blog-publishing", "article"],
+    "epic-delivery": ["epic-delivery", "epic", "capability:C7", "capability:C19"],
+    "research-arb": ["research-arb", "research", "arb"],
+    "research": ["research", "research-arb", "arb"],
+    "platform-ops": ["platform-ops", "platform", "ops"],
+}
+
+
+def _infer_briefing_task_types(task: Task) -> list[str]:
+    """Infer candidate ``task_type`` values to look up in ``agent_briefings``.
+
+    Scans the task title, body, and labels for capability references
+    (``capability:C*``) and semantic aliases (blog, epic, research, …).
+    Returns an ordered list of candidates — first match wins at query time.
+    """
+    import re
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str) -> None:
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append(value)
+
+    # 1. Capability labels (e.g. "capability:C7", "capability:C51")
+    if hasattr(task, "labels") and task.labels:
+        for label in task.labels:
+            _add(str(label).strip())
+            if ":" in str(label):
+                _add(str(label).split(":", 1)[1])
+
+    # 2. Search title + body for capability:C* patterns
+    text = " ".join(p for p in (task.title or "", task.body or "") if p)
+    for m in re.finditer(r"capability:(C\d+)", text, re.IGNORECASE):
+        _add(f"capability:{m.group(1)}")
+        _add(m.group(1))
+
+    # 3. Search title + body for bare C* patterns (C7, C51, etc.)
+    for m in re.finditer(r"\b(C\d{1,3})\b", text):
+        cap = m.group(1)
+        _add(f"capability:{cap}")
+        _add(cap)
+
+    # 4. Semantic aliases from title/body keywords
+    text_lower = text.lower()
+    alias_map = {
+        "blog-publishing": ("blog", "article", "publishing"),
+        "epic-delivery": ("epic", "delivery", "phase"),
+        "research-arb": ("research", "arb", "architecture review"),
+        "platform-ops": ("platform", "ops", "infrastructure"),
+    }
+    for db_type, keywords in alias_map.items():
+        if any(kw in text_lower for kw in keywords):
+            for alias in _TASK_TYPE_ALIASES.get(db_type, [db_type]):
+                _add(alias)
+
+    return candidates
+
+
+def _get_briefing(
+    conn: sqlite3.Connection, profile: str, task_types: list[str],
+) -> Optional[sqlite3.Row]:
+    """Query ``agent_briefings`` for the first matching (profile, task_type) row.
+
+    Falls back to the ``default`` profile if no briefing exists for the
+    task's assignee. Returns ``None`` when no briefing exists for any
+    candidate task_type under either profile.
+    """
+    if not task_types:
+        return None
+    for prof in (profile, "default"):
+        for tt in task_types:
+            row = conn.execute(
+                "SELECT * FROM agent_briefings WHERE profile=? AND task_type=? LIMIT 1",
+                (prof, tt),
+            ).fetchone()
+            if row is not None:
+                return row
+    return None
+
+
+def _ctx_briefing(
+    lines: list[str], conn: sqlite3.Connection, task: Task, now: int,
+) -> None:
+    """Inject a pre-compiled agent briefing as pre-context for this task.
+
+    Queries ``agent_briefings`` for a confidence-weighted, compressed
+    knowledge briefing matching the task's profile and inferred task_type.
+    The briefing is injected after the header/body and before prior attempts.
+    Silently omitted when no briefing exists or the table is absent.
+    """
+    try:
+        conn.execute("SELECT 1 FROM agent_briefings LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return  # Table doesn't exist — skip silently
+
+    task_types = _infer_briefing_task_types(task)
+    if not task_types:
+        return
+
+    profile = task.assignee or "default"
+    row = _get_briefing(conn, profile, task_types)
+    if row is None:
+        return  # No briefing for this task type — skip silently
+
+    briefing = row["briefing"] if "briefing" in row.keys() else None
+    if not briefing or not briefing.strip():
+        return
+
+    briefing_text = _ctx_cap(briefing, _CTX_MAX_BRIEFING_BYTES)
+    compiled_at = row["compiled_at"] if "compiled_at" in row.keys() else None
+    token_count = row["token_count"] if "token_count" in row.keys() else None
+    reduction_ratio = row["reduction_ratio"] if "reduction_ratio" in row.keys() else None
+    task_type = row["task_type"] if "task_type" in row.keys() else "?"
+    briefing_profile = row["profile"] if "profile" in row.keys() else "?"
+
+    lines.append("## Agent Briefing (pre-compiled context)")
+    lines.append("")
+    lines.append(
+        f"_Profile: {briefing_profile} | Task type: {task_type} | "
+        f"Compiled: {_ctx_stamp(int(compiled_at), now) if compiled_at else 'unknown'}_"
+    )
+    if token_count:
+        lines.append(
+            f"_Compressed: {int(token_count):,} tokens"
+            + (f" ({reduction_ratio:.1%} of full read)" if reduction_ratio else "")
+            + "_"
+        )
+    lines.append("")
+
+    # Staleness check: compare compiled_at to last graph rebuild timestamp.
+    if compiled_at:
+        try:
+            _assignee = task.assignee or "default"
+            state_path = os.path.join(
+                os.path.expanduser("~"), ".hermes", "veviki-state",
+                _assignee, "last_refresh.txt",
+            )
+            if os.path.exists(state_path):
+                from datetime import datetime, timezone as _tz
+                last_str = open(state_path).read().strip()
+                last_dt = datetime.fromisoformat(last_str)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=_tz.utc)
+                last_ts = last_dt.timestamp()
+                if int(compiled_at) < int(last_ts):
+                    age = _relative_age(int(compiled_at), now)
+                    lines.append(
+                        f"_⚠ Briefing may be stale (compiled {age}, "
+                        f"before the last knowledge graph rebuild). "
+                        f"A recompile is pending via km_lazy_refresh.py._"
+                    )
+                    lines.append("")
+        except Exception:
+            pass  # Best-effort staleness check; never block on it
+
+    lines.append(briefing_text)
     lines.append("")
 
 
