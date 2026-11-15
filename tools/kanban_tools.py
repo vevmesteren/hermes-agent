@@ -22,7 +22,7 @@ from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+    KANBAN_CHECKPOINT_EVIDENCE_SCHEMA, KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
@@ -1000,6 +1000,78 @@ def _handle_link(args: dict, **kw) -> str:
         return _ok(parent_id=parent_id, child_id=child_id)
 
 
+@_kanban_handler("kanban_checkpoint_evidence")
+def _handle_checkpoint_evidence(args: dict, **kw) -> str:
+    """Register checkpoint evidence for the current task — verifies the file
+    exists, hashes it, inserts into checkpoint_evidence, and sets the CP flag."""
+    import hashlib
+
+    tid = _worker_guard("kanban_checkpoint_evidence", args)
+    checkpoint = _require_text(args, "checkpoint",
+        "checkpoint is required — must be one of: 'cp0', 'cp0.5', 'cp1', 'cp2', 'cp3', 'cp4'")
+    evidence_path = _require_text(args, "evidence_path",
+        "evidence_path is required — absolute or tilde-relative path to the evidence file on disk")
+    model_family = args.get("model_family")
+
+    # Validate checkpoint name
+    _VALID_CHECKPOINTS = {"cp0", "cp0.5", "cp1", "cp2", "cp3", "cp4"}
+    _check(checkpoint in _VALID_CHECKPOINTS,
+           f"checkpoint must be one of {sorted(_VALID_CHECKPOINTS)}, got: {checkpoint!r}")
+
+    # Expand ~ and verify file exists
+    expanded_path = os.path.expanduser(evidence_path)
+    _check(os.path.isfile(expanded_path),
+           f"evidence file not found at {evidence_path} (expanded: {expanded_path})")
+
+    # Compute SHA-256
+    with open(expanded_path, "rb") as f:
+        sha256 = hashlib.sha256(f.read()).hexdigest()
+
+    # Map checkpoint to the CP flag column on tasks
+    _CP_FLAG_MAP = {
+        "cp0":   "cp0_intake_completed",
+        "cp0.5": "cp0_5_decomposition_completed",
+        "cp1":   "cp1_readiness_completed",
+        "cp2":   "cp2_review_completed",
+        "cp3":   "cp3_merge_completed",
+        "cp4":   "cp4_closure_completed",
+    }
+    flag_col = _CP_FLAG_MAP[checkpoint]
+
+    with _board(args.get("board")) as (kb, conn):
+        # Verify the task exists and the worker owns it
+        _existing_task(kb, conn, tid)
+
+        # Insert into checkpoint_evidence (UNIQUE on task_id+checkpoint — upsert)
+        conn.execute(
+            "INSERT INTO checkpoint_evidence (task_id, checkpoint, evidence_path, evidence_sha256, written_at, writer_model_family) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, checkpoint) DO UPDATE SET "
+            "  evidence_path = excluded.evidence_path, "
+            "  evidence_sha256 = excluded.evidence_sha256, "
+            "  written_at = excluded.written_at, "
+            "  writer_model_family = excluded.writer_model_family",
+            (tid, checkpoint, expanded_path, sha256, int(time.time()), model_family)
+        )
+
+        # Set the corresponding CP flag on the task
+        conn.execute(
+            f"UPDATE tasks SET {flag_col} = 1 WHERE id = ?",
+            (tid,)
+        )
+
+        conn.commit()
+
+    return _ok(
+        task_id=tid,
+        checkpoint=checkpoint,
+        evidence_path=expanded_path,
+        evidence_sha256=sha256,
+        flag_column=flag_col,
+        model_family=model_family,
+    )
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
@@ -1018,7 +1090,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("kanban_checkpoint_evidence", KANBAN_CHECKPOINT_EVIDENCE_SCHEMA, _handle_checkpoint_evidence, "🔒"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode

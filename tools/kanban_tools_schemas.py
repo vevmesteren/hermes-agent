@@ -531,3 +531,34 @@ KANBAN_LINK_SCHEMA = _schema(
     },
     ["parent_id", "child_id"],
 )
+
+KANBAN_CHECKPOINT_EVIDENCE_SCHEMA = _schema(
+    "kanban_checkpoint_evidence",
+    (
+        "Register checkpoint evidence for the current task. Verifies the "
+        "evidence file exists on disk, computes its SHA-256 hash, inserts "
+        "a row into the checkpoint_evidence table, and sets the "
+        "corresponding checkpoint flag on the task. Call this after "
+        "persisting a checkpoint artifact to disk (e.g. after writing "
+        "the CP-0 routing decision JSON). Without this step, "
+        "kanban_complete will be REJECTED by the checkpoint gate trigger."
+    ),
+    {
+        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "checkpoint": _prop("string", (
+            "Checkpoint identifier. Must be one of: "
+            "'cp0', 'cp0.5', 'cp1', 'cp2', 'cp3', 'cp4'."
+        )),
+        "evidence_path": _prop("string", (
+            "Absolute or tilde-relative path to the evidence file on disk. "
+            "The file must exist when this tool is called."
+        )),
+        "model_family": _prop("string", (
+            "Optional. The model family that produced the evidence (e.g. "
+            "'claude', 'deepseek', 'glm'). Required for cp2 (cold review "
+            "independence check). For other checkpoints, it is recorded "
+            "for audit but not enforced."
+        )),
+    },
+    ["checkpoint", "evidence_path"],
+)
