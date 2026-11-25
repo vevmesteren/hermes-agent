@@ -834,6 +834,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+| `worker_env_allowlist` | _(unset)_ | Explicit allowlist of environment variable names a dispatched worker receives. When set, the worker env is built by copying only allowlisted vars from the dispatcher's env (plus structurally-required `HERMES_KANBAN_*` vars) — not by inheriting the full parent env and scrubbing secrets. A name ending in `*` is a prefix wildcard (`LC_*` matches `LC_CTYPE`, `LC_ALL`). When unset, the dispatch falls back to the inherit-scrub-inject behavior and logs a deprecation warning. See [Worker environment allowlist](#worker-environment-allowlist). |
 
 And the two auxiliary LLM slots:
 
@@ -841,6 +842,50 @@ And the two auxiliary LLM slots:
 |---|---|
 | `auxiliary.kanban_decomposer` | Model that produces the task graph (called by Decompose). Set `provider`/`model` to override the main chat model. |
 | `auxiliary.profile_describer` | Model that auto-generates profile descriptions (called by `hermes profile describe --auto`). |
+
+### Worker environment allowlist
+
+When `kanban.worker_env_allowlist` is set in `config.yaml`, the dispatch
+mechanism builds the worker agent's environment by copying **only** the
+allowlisted variables from the dispatcher's environment — plus the
+structurally-required `HERMES_KANBAN_*` variables that the worker client reads
+from `os.environ`. This replaces the inherit-scrub-inject pattern: instead of
+inheriting the full parent environment and selectively scrubbing known secrets,
+the allowlist is the gate. If a variable isn't on the list, it doesn't get
+through — making secret leakage structurally impossible, not just patched.
+
+```yaml
+# config.yaml
+kanban:
+  worker_env_allowlist:
+    # Host plumbing — never a profile's settings or secrets
+    - PATH
+    - HOME
+    - USER
+    - LANG
+    - LC_*              # prefix wildcard: matches LC_CTYPE, LC_ALL, ...
+    - HERMES_HOME
+    - TERMINAL_TIMEOUT
+    # ... add other vars your workers need (this IS the full list)
+```
+
+**Prefix wildcards:** a name ending in `*` matches any env var whose name
+starts with the prefix (case-insensitively). `LC_*` matches `LC_CTYPE`,
+`LC_ALL`, `LC_MESSAGES`, etc.
+
+**Structurally-required vars:** `HERMES_KANBAN_*` variables are always kept
+regardless of the allowlist — they are injected by the dispatch mechanism and
+read by the worker client. The config backend's deployment env names (which
+backend, which plane, which instance) are also always kept.
+
+**Fallback:** when `worker_env_allowlist` is unset (the key is omitted from
+`config.yaml`), the dispatch mechanism falls back to the current
+inherit-scrub-inject behavior and logs a deprecation warning. Set the key
+explicitly to enable allowlist-based env construction.
+
+**Defense-in-depth:** the `build_subprocess_env` secret scrub stays in the
+codebase as defense-in-depth for the fallback path and other callers. In the
+allowlist path it is not the primary gate — the allowlist is.
 
 ### Architecture
 
