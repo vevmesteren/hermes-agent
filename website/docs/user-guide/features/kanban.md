@@ -866,7 +866,7 @@ kanban:
     - LC_*              # prefix wildcard: matches LC_CTYPE, LC_ALL, ...
     - HERMES_HOME
     - TERMINAL_TIMEOUT
-    # ... (see the default config.yaml for the full list)
+    # ... add other vars your workers need (this IS the full list)
 ```
 
 **Prefix wildcards:** a name ending in `*` matches any env var whose name
