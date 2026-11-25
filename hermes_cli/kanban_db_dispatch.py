@@ -1905,6 +1905,58 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def configured_worker_env_allowlist() -> Optional[frozenset[str]]:
+    """Read ``kanban.worker_env_allowlist`` from config, or None when unset.
+
+    When set, ``_default_spawn`` builds the worker env by copying only
+    allowlisted vars from the parent env (plus structurally-required
+    ``HERMES_KANBAN_*`` vars), replacing the inherit-scrub-inject pattern.
+    When unset, the dispatch mechanism falls back to the current behavior
+    and logs a deprecation warning (see ``_default_spawn``).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("worker_env_allowlist")
+    except Exception:
+        return None
+    if raw is None or not isinstance(raw, list):
+        return None
+    return frozenset(str(name) for name in raw if name)
+
+
+def _allowlist_env_filter(
+    env: Mapping[str, str], allowlist: frozenset[str],
+) -> dict[str, str]:
+    """Filter *env* to only keys on *allowlist* plus structurally-required vars.
+
+    The allowlist is matched case-insensitively (Windows env blocks are not
+    case-sensitive).  A name ending in ``*`` is a prefix wildcard (e.g.
+    ``LC_*`` matches ``LC_CTYPE``, ``LC_ALL``).  ``HERMES_KANBAN_*`` vars are
+    always kept — they are structurally injected by ``_default_spawn`` and read
+    by ``kanban_worker_client`` from ``os.environ``.  The config backend's
+    deployment env names (which backend, which plane, which instance) are also
+    always kept — they are the instance's, not a profile's.
+    """
+    from hermes_cli.config_backend import deployment_env_names
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for name in allowlist:
+        if name.endswith("*"):
+            prefixes.append(name[:-1].upper())
+        else:
+            exact.add(name.upper())
+    deploy = {name.upper() for name in deployment_env_names()}
+    out: dict[str, str] = {}
+    for key, value in env.items():
+        ku = key.upper()
+        if (ku in exact
+                or any(ku.startswith(p) for p in prefixes)
+                or ku in deploy
+                or ku.startswith("HERMES_KANBAN_")):
+            out[key] = value
+    return out
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -2716,19 +2768,46 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Gating on the gateway-wide flag left B's worker inheriting the dispatcher's own OPENAI_API_KEY and
     # systemd-injected tokens on every single-profile host.
     routed = bool(profile_home) and _is_routed_home(profile_home)
-    # build_subprocess_env's secret scrub resolves terminal.env_passthrough vars through get_secret(),
-    # which without a bound scope reads the LAUNCH profile's ambient environment for a worker spawned
-    # on B's behalf (and raises under multiplex) — so bind B's whole scope around the build.
-    with (_worker_profile_scope(profile_home) if profile_home
-          else contextlib.nullcontext()):
-        env = build_subprocess_env(
-            scrub_secrets=is_multiplex_active() or routed,
-            inherit_profile_home=True,
-        )
-    # For another profile, host plumbing only: a gateway the client cold-starts gets this env plus the
-    # assignee's secrets, which replace values but never remove one (kanban_worker_env).
-    if routed:
-        env = worker_client_env(env, profile_home)
+    # Build the worker env.  When ``kanban.worker_env_allowlist`` is set in
+    # config, the env is built by copying only allowlisted vars from the parent
+    # env (plus structurally-required ``HERMES_KANBAN_*`` vars) — the allowlist
+    # IS the gate, making secret leakage structurally impossible: if a var
+    # isn't on the list, it doesn't get through.  When unset, fall back to the
+    # inherit-scrub-inject pattern and log a deprecation warning.  The
+    # ``build_subprocess_env`` scrub stays as defense-in-depth in the fallback
+    # path and for other callers; in the allowlist path it is not the primary
+    # gate (the allowlist is).
+    allowlist = configured_worker_env_allowlist()
+    if allowlist is not None:
+        # build_subprocess_env's secret scrub resolves terminal.env_passthrough
+        # vars through get_secret(), which without a bound scope reads the
+        # LAUNCH profile's ambient environment for a worker spawned on B's
+        # behalf — so bind B's whole scope around the build.  scrub_secrets=False
+        # here: the allowlist filter is the primary gate; the scrub is not
+        # needed (it stays as defense-in-depth for the fallback path below).
+        with (_worker_profile_scope(profile_home) if profile_home
+              else contextlib.nullcontext()):
+            base = build_subprocess_env(
+                scrub_secrets=False,
+                inherit_profile_home=True,
+            )
+        if routed:
+            base = worker_client_env(base, profile_home)
+        env = _allowlist_env_filter(base, allowlist)
+    else:
+        import logging
+        logging.getLogger(__name__).warning(
+            "kanban.worker_env_allowlist is not set in config; falling back "
+            "to inherit-scrub-inject behavior. Set kanban.worker_env_allowlist "
+            "in config.yaml to enable allowlist-based worker env construction.")
+        with (_worker_profile_scope(profile_home) if profile_home
+              else contextlib.nullcontext()):
+            env = build_subprocess_env(
+                scrub_secrets=is_multiplex_active() or routed,
+                inherit_profile_home=True,
+            )
+        if routed:
+            env = worker_client_env(env, profile_home)
     # The dispatcher is detached from every conversation; its worker must never
     # inherit routing mirrored by a previous gateway turn.
     from gateway.session_context import _VAR_MAP
